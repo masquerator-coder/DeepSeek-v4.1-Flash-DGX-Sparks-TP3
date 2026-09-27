@@ -1,0 +1,18 @@
+time_to_first_token_seconds        n=24        mean=   2.3406s  P50=2.222  P90=5.067  P99=7.520
+  ���� is_streaming="false"
+time_to_first_token_seconds        n=2404      mean=   6.0570s  P50=0.980  P90=5.900  P99=114.143
+  ���� is_streaming="true"
+e2e_request_latency_seconds        n=24        mean=   4.2800s  P50=2.250  P90=5.733  P99=55.200
+  ���� is_streaming="false"
+e2e_request_latency_seconds        n=2404      mean=  12.2799s  P50=2.937  P90=27.574  P99=184.933
+  ���� is_streaming="true"
+inter_token_latency_seconds        n=514208    mean=   0.0292s  P50=0.014  P90=0.032  P99=0.138
+  ���� model_name="deepseek-v4.1-flash"
+queue_time_seconds                 n=9597      mean=   0.0666s  P50=0.001  P90=0.005  P99=0.039
+  ���� moe_ep_rank="0",pp_rank="0",tp_rank="0"
+per_stage_req_latency_seconds      n=19351     mean=   0.6486s  P50=0.698  P90=0.842  P99=1.337
+  ���� moe_ep_rank="0",pp_rank="0",stage="chunked_prefill",tp_rank="0"
+per_stage_req_latency_seconds      n=9597      mean=   1.4792s  P50=0.111  P90=0.892  P99=57.500
+  ���� moe_ep_rank="0",pp_rank="0",stage="prefill_forward",tp_rank="0"
+per_stage_req_latency_seconds      n=9597      mean=   0.0000s  P50=0.001  P90=0.001  P99=0.001
+  ���� moe_ep_rank="0",pp_rank="0",stage="request_process",tp_rank="0"

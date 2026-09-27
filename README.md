@@ -3,9 +3,27 @@
 三台 DGX Spark（GB10）用 CX7 直连成**三角**拓扑，跑 DeepSeek-V4.1-Flash 推理服务
 （`max_model_len=262144`、`max_total_num_tokens=750000`）。
 
-## 当前状态（2026-09-26 实测）
+## 当前状态（2026-09-27 实测）
 
 配置：`EP_SIZE=1` · `CHUNKED_PREFILL_SIZE=1024` · `MEM_FRACTION_STATIC=0.95` · `NCCL_NET=IB`
+
+**现役启动参数的权威读数**（`curl -s <url>/get_server_info`，见 §8.1）：
+
+| 参数 | 实测值 | 参数 | 实测值 |
+|---|---|---|---|
+| `tp_size` / `ep_size` | 3 / 1 | `page_size` | 256 |
+| `chunked_prefill_size` | 1024 | `kv_cache_dtype` | `fp8_e4m3` |
+| `context_length` | 262144 | `attention_backend` | `dsv4` |
+| `max_running_requests` | **8** | `moe_runner_backend` | `flashinfer_mxfp4` |
+| `max_total_tokens` | 750000 | `fp8_gemm_runner_backend` | `flashinfer_cutlass` |
+| `max_total_num_tokens`（KV 池） | 749824 | `speculative_algorithm` | `DSPARK` |
+| `mem_fraction_static` | 0.95 | `speculative_dspark_block_size` | **5** ⚠️ 见 §8.2 |
+| `schedule_policy` | `fcfs` | `min_free_slots_delay` | 1 |
+| `watchdog_timeout` | 1800 | `enable_metrics` | `True` |
+
+> ⚠️ `max_running_requests=8`、`max_total_tokens=750000`、`min_free_slots_delay=1` 三项
+> **只存在于线上 `.env`，本仓库的 `env.example` 未收录**（`env.example` 仍是旧档，见 §8.5）。
+> 要复现现役行为，必须显式设置这三项。
 
 ### A. 预填（prefill）实测
 
@@ -14,12 +32,12 @@
 
 | prompt 长度（实测 `prompt_tokens`） | 预填 tok/s | 证据 |
 |---|---|---|
-| ≈4k 档（唯一 prompt） | **2223**（同口径四臂 A/B：`off1024` 2225 / `on1024` 2223） | [`INDEXER-CHUNKED-TP3-RESULTS.md:290-295`](docs/INDEXER-CHUNKED-TP3-RESULTS.md#L290-L295) |
+| ≈4k 档（唯一 prompt） | **2223**（同口径四臂 A/B：`off1024` 2225 / `on1024` 2223） | [`INDEXER-CHUNKED-TP3-RESULTS.md:294-299`](docs/INDEXER-CHUNKED-TP3-RESULTS.md#L294-L299) |
 | ~100k（99,957） | 1864 | [`…RESULTS.md:343-348`](docs/INDEXER-CHUNKED-TP3-RESULTS.md#L343-L348) |
 | ~130k（129,616） | 1880 | 同上 |
 | ~160k（160,183） | 1835 | 同上 |
 | ~200k（199,533–200,054，顺序 5 次） | **1840**（1759–1846，离散度 5.2%） | [`…RESULTS.md:262-267`](docs/INDEXER-CHUNKED-TP3-RESULTS.md#L262-L267) |
-| ~255k（**254,811**） | **1609** | [`…RESULTS.md:151-157`](docs/INDEXER-CHUNKED-TP3-RESULTS.md#L151-L157) |
+| ~255k（**254,811**） | **1609** | [`…RESULTS.md:157-161`](docs/INDEXER-CHUNKED-TP3-RESULTS.md#L157-L161) |
 
 > **与上游对照**：上游 TP3 首页只给了一句 `Prefill, 3 Sparks (TP=3) | ~2,000 tok/s`（**无口径**）。
 > 我们 ≈4k 档 **2223**，比它高约 **11%**；但这 +11% 几乎全部来自 **`chunk` 768→1024** 这一个旋钮
@@ -33,11 +51,11 @@
 
 | 负载 | 并发 | 实测 tok/s | 证据 |
 |---|---|---|---|
-| 散文 greedy | C1 | **33.6** | [`…RESULTS.md:290-295`](docs/INDEXER-CHUNKED-TP3-RESULTS.md#L290-L295) |
+| 散文 greedy | C1 | **33.6** | [`…RESULTS.md:294-299`](docs/INDEXER-CHUNKED-TP3-RESULTS.md#L294-L299) |
 | 散文 sampled | C1 | **35.3** | 同上 |
 | 代码 greedy | C1 | **79.3** | 同上 |
 | 散文 greedy | C4 聚合 | **76.5** | 同上 |
-| 散文/计数（高可预测内容） | C1 | 最高 **87** | [`README` §口径 1](#报数必带口径) |
+| 散文/计数（高可预测内容） | C1 | 最高 **87** | 见下方 [报数必带口径](#e-报数必带口径) |
 | socket 兜底档对照（RoCE 未修好时，仅作对照） | C1 / C4 | 17.9–19.2 / 39.7–43.3 | [`DEPLOY-RECORD:206-207`](docs/DEPLOY-RECORD-dsv41.md#L206-L207) |
 
 ### C. 其它
@@ -49,7 +67,51 @@
 | fabric `all_reduce` 256 MB | 13.86 GB/s |
 | 三台容器 | healthy · `via NET/IB` 64 条 · `reg_mr` 失败 0 |
 
-**报数必带口径**（三条都会显著影响数字）：
+### D. 尾延迟（2026-09-27 实测，**生产流量**）
+
+口径：引擎自带的 Prometheus 直方图，**自启动以来累积的 2403 个真实请求**——
+不是压测样本，是线上实际负载。脚本 `scripts/bench_tail.py`（本仓库，只读）。
+
+> ⚠️ **这是一个负载窗口的快照，不是稳态 SLA**。直方图是**累积**的，随流量构成漂移
+> （复采一次：n 2403→2483，TTFT P99 114.2→111.3 s、ITL mean 29.2→28.3 ms —— 同量级但非定值）。
+> 要比较两个配置，用 `bench_tail.py --reset` / `--diff` 取**同一窗口**的增量，
+> 并确保两臂在同一时段、同样负载下测。
+
+| 指标 | P50 | P90 | P99 | mean |
+|---|---|---|---|---|
+| TTFT（streaming） | **0.98 s** | 5.90 s | **114.2 s** | 6.06 s |
+| E2E（streaming） | 2.94 s | 27.60 s | **185.0 s** | 12.28 s |
+| ITL（逐 token） | 14 ms | 32 ms | 138 ms | **29.2 ms** |
+| **queue_time** | 0.001 s | 0.005 s | **0.039 s** | 0.067 s |
+
+**派生比率**（同窗口）：
+
+| 指标 | 值 |
+|---|---|
+| 平均 prompt | **64,580** token |
+| 平均 uncached | 8,566 token |
+| 前缀缓存命中率 | **86.7 %** |
+| 平均生成长度 | 213 token |
+| prompt > 100k 的请求占比 | **27.4 %** |
+
+**三条结论**（都可从上面数据直接读出）：
+
+1. **TTFT 是严重双峰分布**：52% 的请求 <1 s，但 10% 落在 6 s 以上，P99 达 **114 s**。
+   **不是"普遍慢"，是两类完全不同的体验。**
+2. **瓶颈不是排队**：`queue_time` 的 P99 只有 **39 ms**。
+   ⇒ 114 s 的长尾来自**长 prompt 的预填本身**（27.4% 的请求 >100k token）。
+   > 与 09-21 那次"5 × 126k 撑爆 500k 池 → FCFS 排队 → TTFT 248 s"的故障**机制不同**：
+   > 池已从 500k 提到 **750k**（实测 `max_total_num_tokens=749824`），排队问题已修掉。
+3. **ITL 自洽性交叉验证通过**：mean 29.2 ms ⇒ 单流 34.3 tok/s，
+   与 §B 的散文 greedy **33.6** 吻合 ⇒ 说明采集脚本的解析口径正确。
+
+> ⚠️ **推论（不是实测）**：既然不是排队，**单纯提高 `MAX_RUNNING_REQUESTS` 对尾延迟帮助有限**。
+> 尾延迟的正确杠杆是**预填速度**与长 prompt 的前缀缓存命中率。
+> 这一条**尚未做受控验证**——§8.4 记的"并发扫描未做"正指此处。
+
+### E. 报数必带口径
+
+以下三条都会显著影响数字：
 
 1. **单流 decode 速度强依赖内容**：数数字这类高可预测内容可到 **87 tok/s**，散文只有 **34** ——
    差异来自投机解码接受率，不是系统变慢。**不写负载类型的吞吐数没有意义。**
@@ -209,6 +271,8 @@ scripts/                  可直接复用的脚本
   svc.sh                  服务启停与体检：preflight / start / stop / restart / status / logs
   svc-boot.sh             开机自启包装            dsv41.service    systemd 单元
   bench_migration.py      主基准：C1 散文(sampled+greedy) + C1 代码 + C4，每请求唯一 prompt
+  bench_tail.py           尾延迟分位数（P50/P90/P99）—— 从 /metrics 直方图桶读，
+                          `--reset`/`--diff` 取窗口增量，见 §D 与 §8.1
   bench_prefill.py        预填基准（唯一 prompt + 扣解码修正）
   bench_longctx.py        长上下文稳健性（重复 + 并发）
   patch_startsh_envvar.py 给 start.sh 补 env 透传（head + worker 两处，幂等）
@@ -222,7 +286,15 @@ scripts/                  可直接复用的脚本
 
 fleet/                    线上引擎侧**文件本体**快照（17 个 adapter + 4 个部署文件，见 fleet/README.md）
   Dockerfile              基础镜像之上的 overlay —— **adapter 就是在这里 COPY 进镜像的**
-  start.sh / boot.py / files/nfs-share.sh   启动器 / 容器入口 / NFS 导出（含 14 个 DSV41_* 透传）
+  start.sh / boot.py / files/nfs-share.sh   启动器 / 容器入口 / NFS 导出
+
+  # start.sh 的 env 透传计数有两个不同口径，别混：
+  #   · 文件里**当前共有** 30 个 DSV41_* 透传（head 段与 worker 段各 30，实测一致）
+  #   · 其中**相对上游新增**的是 14 个（12 个解码栈 + 2 个 indexer）—— 这个数在 NOTICE 里
+  #   · 另有 9 个非 DSV41_ 前缀的增补（NCCL_IB_USE_INLINE / NCCL_IB_PREPOST_RECEIVE_WORK_REQUESTS /
+  #     DSPARK_ALIGN_VERIFY_TO_TIER / SGLANG_RAGGED_VERIFY_MODE / SGLANG_SIMULATE_ACC_LEN /
+  #     SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE / SGLANG_DSPARK_ENABLE_SPS_RECORD /
+  #     NCCL_NET_GDR_LEVEL / NCCL_DMABUF_ENABLE）
 assets/                   netplan 示例 + 已作废的 NCCL 拓扑文件
 env.example               环境变量样例（已脱敏，RoCE 档 + socket 回退注释）
 ```
@@ -234,27 +306,80 @@ env.example               环境变量样例（已脱敏，RoCE 档 + socket 回
 | 节点 | 3 × DGX Spark（GB10），每机 1 颗 GPU，121.7 GiB 统一内存 |
 | 内核 / 驱动 | **`6.17.0-1031-nvidia` / `580.173.02`**（配对标；`7.0.0-1019` 有 CMA 回归，见 §2）|
 | NCCL | 镜像自带 2.30.7（**不需要任何补丁**）|
-| 引擎 | 厂商 sglang 镜像，内部 build `da64c5cbb`（`lmsysorg/sglang:dev-dsv41`）|
-| 容器镜像 | `dsv41-3xspark:local`（由 `fleet/` 的 Dockerfile overlay 构建）|
+| 引擎 | 厂商 sglang 镜像，内部 build `da64c5cbb`（`lmsysorg/sglang:dev-dsv41`，实测 `/get_server_info` 的 `version` 字段）|
+| 容器镜像 | `dsv41-3x-spark:local`（由 `fleet/` 的 Dockerfile overlay 构建）|
+
+> **镜像名的正确拼法是 `dsv41-3x-spark:local`**（`fleet/start.sh:89` 的 `${IMAGE:-...}` 默认值），
+> 工作目录同理是 `~/dsv41-3x-spark`（`start.sh:92` 的 `WORKER_DIR`）。
+> 早先文档里写成 `dsv41-3xspark:local`（无中横线）是**笔误**——与实际镜像名不符，照抄会 `image not found`。
 
 > DGX 上**驱动与内核是配对的**（`580.173.02 ↔ 6.17.0-1031`、`580.178.04 ↔ 7.0.0-1019`）。
 > 换内核必须同时换驱动；降级驱动会卸掉当前内核的驱动模块，所以"降驱动 + 引导旧内核"必须成对做。
 
-## 8. 已知限制
+## 8. 已知限制与待澄清项
 
-- **`indexer_chunked` backport 的收益假设经实测落空**（2026-09-26，详见
-  [`docs/INDEXER-CHUNKED-TP3-RESULTS.md`](docs/INDEXER-CHUNKED-TP3-RESULTS.md)）：对性能
-  **无可测影响**，**也不是** `CHUNKED_PREFILL_SIZE=1024` 在长上下文可用的前提（`OFF+1024`
-  到 200k 也全过）。唯一被证实的是**质量零退化**（75 题配对 BROKE=0）。
-  **预填的真正收益来自 chunk 大小本身**（768→1024 约 +11~15%），与该 backport 无关。
-  留它的唯一理由是 >200k 的余量保险——**未验证**（ON 测到 255k，OFF 只到 200k）。
+### 8.1 本轮新增的实测（2026-09-27）
+
+- **尾延迟已测**（§D）：用 `scripts/bench_tail.py` 从 `/metrics` 直方图读到 **2403 个真实请求**的
+  P50/P90/P99。**README 早先"尾延迟未测"的限制已解除**，但只在**当前这一个负载窗口**内成立。
+  证据存档：`docs/tail-latency-live-20260927-1026.txt`、`docs/live-config-20260927.txt`。
+- **`/get_server_info` 是现役参数的权威读数**：它返回完整启动参数（176 个非默认字段）。
+  核对现役配置**不要**去猜 `.env`，直接 `curl -s http://<head>:8888/get_server_info`。
+- **`get_server_info` 查不到 NCCL 变量**（它们是进程 env，非启动参数）——
+  核实 `NCCL_PROTO` / `NCCL_MAX_NCHANNELS` 仍需 SSH 进容器 `docker exec <ctn> env | grep NCCL`。
+
+### 8.2 ⚠️ 待澄清：`DSPARK_BLOCK_SIZE` 线上是 5，但文档说"3 是调优值"
+
+实测 `speculative_dspark_block_size = 5`（§现役参数表），而仓库内有**互相矛盾**的记载：
+
+| 来源 | 说法 |
+|---|---|
+| 实测结论 | "**采样生成（temp>0）下 block 5 是负优化**（−10%）；仅在 greedy 为正。**已复位 3**"（[`DEPLOY-RECORD:420`](docs/DEPLOY-RECORD-dsv41.md#L420)）|
+| 避坑清单 | `DSPARK_BLOCK_SIZE` = **3**；k=5 在聊天/散文上**过度起草**（[`PITFALLS.md:229`](docs/PITFALLS.md#L229)、[`:26`](docs/PITFALLS.md#L26)）|
+| 部署手册 | "k=3 是调优值……**勿随意改**"（[`DEPLOY-GUIDE.md:194`](docs/DEPLOY-GUIDE.md#L194)）|
+| 迁移记录 | 批次 2 改成 5，且现行配置写 **5**（[`BATCH-MIGRATION:15`](docs/BATCH-MIGRATION-2026-09-25.md#L15)、[`:136`](docs/BATCH-MIGRATION-2026-09-25.md#L136)）|
+
+**推断（非事实）**：09-25 提 k 到 5 是因为它在**代码负载**上收益明显（C1 代码 58.71→74.60，+27%），
+而 09-19 的"复位 3"结论出自**散文/聊天**负载。**两个结论可能都对，只是负载不同。**
+
+⇒ **要回答的是"当前生产负载下 k 该用几"**，而不是"哪个文档对"。
+事前方案（含单变量设计、重 tune 陷阱、回滚）见
+[`docs/K3-VS-K5-AB-PLAN.md`](docs/K3-VS-K5-AB-PLAN.md)。**尚未执行。**
+
+> 旁证：§D 的 ITL 分布 P50=14 ms（≈71 tok/s）落在"代码/高可预测"档，
+> 但**这不能区分 greedy 与采样**，故仍需业务侧确认线上温度配比。
+
+### 8.3 `indexer_chunked` backport：收益落空（保留仅为余量保险）
+
+2026-09-26，详见 [`docs/INDEXER-CHUNKED-TP3-RESULTS.md`](docs/INDEXER-CHUNKED-TP3-RESULTS.md)：
+对性能**无可测影响**，**也不是** `CHUNKED_PREFILL_SIZE=1024` 在长上下文可用的前提
+（`OFF+1024` 到 200k 也全过）。唯一被证实的是**质量零退化**（75 题配对 BROKE=0）。
+**预填的真正收益来自 chunk 大小本身**（768→1024 约 +11~15%），与该 backport 无关。
+留它的唯一理由是 >200k 的余量保险——**未验证**（ON 测到 255k，OFF 只到 200k）。
+
+### 8.4 其它未解项
+
 - **SPS（投机解码吞吐表）在当前构建下无法生效**（`compact` ragged-verify 启动即崩、三处 shape
   不一致），现用 `SGLANG_RAGGED_VERIFY_MODE=static`，表 inert；对并发 ≥2 本可有收益。
+  ⚠️ 注意 `speculative_dspark_sps_table_path` 实测**已设置**为 `/state/dspark_sps.json`
+  （§现役参数表）——即**路径存在但表不被消费**，别误读成"表没配"。
 - **单流解码延迟抖动（历史上 0.9 s ↔ 18 s）只部分处理**：`DSV41_AUTOTUNE_KEEP=1` 后 autotune
   缓存跨重启 `reused`、同一 greedy prompt 连跑 3 次 sha256 一致，**但那种秒级抖动本身没有做
   前后对照测量**，不能声称已消除。已排除 GPU 降频（2.1–2.3 GHz、节流位 0x0）与带宽瓶颈。
-- **尾延迟未测**（只有中位数，没有 P50/P99）；**并发只测到 C4**，更高并发与"高并发 × 长上下文"未测。
+- **并发只测到 C4**，更高并发与"高并发 × 长上下文"未测。
+  （§D 的生产数据覆盖到真实并发，但**未做受控的并发扫描**。）
 - **255k 量级只做过顺序请求**；`OFF+1024` 那组只测到 200k，且未做并发。
+
+### 8.5 文档一致性问题（已修/待修）
+
+| 项 | 状态 |
+|---|---|
+| 镜像名写成 `dsv41-3xspark:local`（实为 `dsv41-3x-spark:local`） | ✅ 本版已修（§7）|
+| `start.sh` 透传计数"14"未区分"新增"与"当前总数"（实为 30） | ✅ 本版已说明（§6）|
+| `env.example` **未收录** `MAX_RUNNING_REQUESTS=8` / `MAX_TOTAL_TOKENS=750000` / `MIN_FREE_SLOTS_DELAY=1` 等现役键 | ⚠️ **待修**——照 `env.example` 复现不出线上行为 |
+| `env.example:47-51` 仍写着"RoCE 三角拓扑实测不可用"的**已作废结论** | ⚠️ **待修**（README 正文已是 RoCE 档）|
+| `svc.sh:4` 注释里的路径 `~/dsv41-3xspark` 与 `start.sh:92` 的 `dsv41-3x-spark` 不一致 | ⚠️ 待核（脚本用 `$ROOT` 自解析，**不影响运行**，仅注释误导）|
+
 - 已验证（2026-09-19）：视觉分支（自造测试图颜色/形状/位置全对）、工具调用（标准 `tool_calls`）、
   三台 `swapoff -a`（`/etc/fstab` 已注释，重启不复活）。
 
