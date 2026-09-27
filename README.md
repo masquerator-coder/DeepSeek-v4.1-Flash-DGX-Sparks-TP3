@@ -7,14 +7,45 @@
 
 配置：`EP_SIZE=1` · `CHUNKED_PREFILL_SIZE=1024` · `MEM_FRACTION_STATIC=0.95` · `NCCL_NET=IB`
 
+### A. 预填（prefill）实测
+
+口径：**非流式 `usage.prompt_tokens`**，**每题唯一随机 prompt**（防 radix 前缀复用），
+**已扣解码时间**（先从 wall 里减掉 `completion_tokens ÷ 实测解码速率`）。脚本 `scripts/bench_prefill.py`。
+
+| prompt 长度（实测 `prompt_tokens`） | 预填 tok/s | 证据 |
+|---|---|---|
+| ≈4k 档（唯一 prompt） | **2223**（同口径四臂 A/B：`off1024` 2225 / `on1024` 2223） | [`INDEXER-CHUNKED-TP3-RESULTS.md:290-295`](docs/INDEXER-CHUNKED-TP3-RESULTS.md#L290-L295) |
+| ~100k（99,957） | 1864 | [`…RESULTS.md:343-348`](docs/INDEXER-CHUNKED-TP3-RESULTS.md#L343-L348) |
+| ~130k（129,616） | 1880 | 同上 |
+| ~160k（160,183） | 1835 | 同上 |
+| ~200k（199,533–200,054，顺序 5 次） | **1840**（1759–1846，离散度 5.2%） | [`…RESULTS.md:262-267`](docs/INDEXER-CHUNKED-TP3-RESULTS.md#L262-L267) |
+| ~255k（**254,811**） | **1609** | [`…RESULTS.md:151-157`](docs/INDEXER-CHUNKED-TP3-RESULTS.md#L151-L157) |
+
+> **与上游对照**：上游 TP3 首页只给了一句 `Prefill, 3 Sparks (TP=3) | ~2,000 tok/s`（**无口径**）。
+> 我们 ≈4k 档 **2223**，比它高约 **11%**；但这 +11% 几乎全部来自 **`chunk` 768→1024** 这一个旋钮
+> （`off768` 1999 → `off1024` 2225，**+11.3%，且与 indexer 无关** —— [`…RESULTS.md:316-336`](docs/INDEXER-CHUNKED-TP3-RESULTS.md#L316-L336)）。
+> 长档（200k / 255k）上游 TP3 **未给任何数**，无对照。
+
+### B. 解码（decode）实测
+
+口径：**非流式 `usage.completion_tokens ÷ 整请求 wall`**，**每题唯一 prompt**，256 token 输出。
+脚本 `scripts/bench_migration.py`。**单流速度强依赖负载内容**（投机解码接受率），故必须写清类型。
+
+| 负载 | 并发 | 实测 tok/s | 证据 |
+|---|---|---|---|
+| 散文 greedy | C1 | **33.6** | [`…RESULTS.md:290-295`](docs/INDEXER-CHUNKED-TP3-RESULTS.md#L290-L295) |
+| 散文 sampled | C1 | **35.3** | 同上 |
+| 代码 greedy | C1 | **79.3** | 同上 |
+| 散文 greedy | C4 聚合 | **76.5** | 同上 |
+| 散文/计数（高可预测内容） | C1 | 最高 **87** | [`README` §口径 1](#报数必带口径) |
+| socket 兜底档对照（RoCE 未修好时，仅作对照） | C1 / C4 | 17.9–19.2 / 39.7–43.3 | [`DEPLOY-RECORD:206-207`](docs/DEPLOY-RECORD-dsv41.md#L206-L207) |
+
+### C. 其它
+
 | 指标 | 实测值 |
 |---|---|
-| 单流散文 greedy / sampled | **33.6 / 35.3 tok/s** |
-| 单流代码 greedy | **79.3 tok/s** |
-| 4 并发聚合 | **76.5 tok/s** |
-| 预填（≈4k 档，扣解码） | **2223 tok/s**（7k–30k 区间约 2260）|
-| 预填 @ ~200k / @ 255k token | **1840 / 1609 tok/s** |
 | 长上下文可用上限 | **254,811 token 实测通过**（262144 的 97%）|
+| 并发长请求 | 3 × ~80k 并发总 wall 114.5 s（与单次 200k 的 108–114 s 几乎相同）|
 | fabric `all_reduce` 256 MB | 13.86 GB/s |
 | 三台容器 | healthy · `via NET/IB` 64 条 · `reg_mr` 失败 0 |
 
@@ -26,6 +57,12 @@
    前缀复用，预填虚高 1.5–2×）；预填数**已扣解码时间**。
 3. **运行间噪声约 ±3–4%**（用"代码路径逐字节等价"的对照臂实测得出）。
    小于 4% 的差异不是真实变化；单流离散最大（±9%），C4 最稳（±0.8%）。
+
+> ⚠️ **两条已作废的历史数字，不要引用**：
+> ① **"预填 ≈3.0k tok/s"** —— 用重复 filler 造 prompt 被 radix 前缀复用导致的虚高 1.5–2×，
+>    唯一 prompt 重测只有 2.0–2.1k（[`DEPLOY-RECORD:354`](docs/DEPLOY-RECORD-dsv41.md#L354)）；
+> ② **"chunk=1024 的收益是 indexer 拿回的"** —— 归因错误，收益来自 chunk 大小本身
+>    （[`…RESULTS.md:316-336`](docs/INDEXER-CHUNKED-TP3-RESULTS.md#L316-L336)）。
 
 ---
 
